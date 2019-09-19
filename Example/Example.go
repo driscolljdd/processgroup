@@ -22,6 +22,14 @@ import (
 		pg.Run("three", worker)
 		pg.Run("four", worker)
 
+		// A new feature (2019-09-19) - we now have shared (pool) channels. Start up some processes to show this off
+		pg.Run("pool01", poolWorker)
+		pg.Run("pool02", poolWorker)
+		pg.Run("pool03", poolWorker)
+
+		// And start a manager who will dole out work to the pool
+		pg.Run("poolBoss", poolBoss)
+
 		// We can also run any process we like that stops when it throws an error
 		// pg.RunStopOnError("errorprone", worker)
 
@@ -81,6 +89,45 @@ import (
 
 			// Loop indefinitely doing our 'work' unless we are no longer alive
 			fmt.Println(process.Name, " working")
+			time.Sleep(time.Second * 1)
+		}
+	}
+
+	func poolWorker(process processgroup.Process) {
+
+		// Subscribe to a shared channel so that we can have a chance to grab incoming work - effectively become part of a worker pool
+		process.Subscribe("work")
+
+		for {
+
+			if(!process.Alive()) {
+
+				return
+			}
+
+			// Wait for a message to come into the shared channel - any processes subscribing to this channel get messages on a first come, first served basis
+			workPacket := process.WaitForSubscribedMessage()
+
+			if(workPacket == nil) {
+
+				continue
+			}
+
+			fmt.Println("Worker",process.Name,"got this work packet:",workPacket)
+		}
+	}
+
+	func poolBoss(process processgroup.Process) {
+
+		for {
+
+			if(!process.Alive()) {
+
+				return
+			}
+
+			// Dump something into the work queue - of course this could be anything including a complex struct to be processed
+			process.SendSubsriberMessage("work", "Something to do")
 			time.Sleep(time.Second * 1)
 		}
 	}

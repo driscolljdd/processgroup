@@ -7,6 +7,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"reflect"
 )
 
 type processAction func(process Process)
@@ -24,6 +25,7 @@ type processAction func(process Process)
 		lock sync.RWMutex
 		log []struct{ Date time.Time; Process, Event string }
 		StopOnError bool
+		workChannels map[string]chan interface{}
 	}
 
 	func (pg *ProcessGroup) setup() {
@@ -44,6 +46,9 @@ type processAction func(process Process)
 
 		// Initialise our processes map
 		pg.processes = make(map[string]Process)
+
+		// Initialise our map of work channels
+		pg.workChannels = make(map[string]chan interface{})
 
 		// Watch for unix signals
 		go func() {
@@ -113,6 +118,23 @@ type processAction func(process Process)
 								}
 							}
 
+						} else if(msg.Subscriber) {
+
+							pg.lock.RLock()
+
+							channel, exists := pg.workChannels[msg.Subject]
+
+							pg.lock.RUnlock()
+
+							if(exists) {
+
+								select {
+
+									case channel <- msg.Message:
+									default:
+								}
+							}
+
 						} else {
 
 							// Find the recipient for this message
@@ -140,6 +162,7 @@ type processAction func(process Process)
 		pg.setupComplete = true
 	}
 
+	// Start up a new process. Give it a name, and the second parameter is a function with this definition -> func <funcname>(process processgroup.Process)
 	func (pg *ProcessGroup) Run(name string, action processAction) {
 
 		// With every public method calling setup, we avoid the need for a constructor function and it becomes safe
@@ -151,6 +174,10 @@ type processAction func(process Process)
 		myProcess.context, myProcess.cancel = context.WithCancel(pg.context)
 		myProcess.channel = make(chan interface{}, 1)
 		myProcess.group_channel = pg.channel
+		myProcess.subscribed_channels = make([]chan interface{}, 0)
+
+		// To allow processes to phone home and set up work channels, include a link back to the parent
+		myProcess.parent = pg
 
 		// Register this process in our collection
 		pg.lock.Lock()
@@ -180,6 +207,7 @@ type processAction func(process Process)
 		myProcess.context, myProcess.cancel = context.WithCancel(pg.context)
 		myProcess.channel = make(chan interface{}, 1)
 		myProcess.group_channel = pg.channel
+		myProcess.subscribed_channels = make([]chan interface{}, 0)
 
 		// Register this process in our collection
 		pg.lock.Lock()
@@ -250,6 +278,39 @@ type processAction func(process Process)
 		}
 	}
 
+	// Allow the main() function or the owner of the process group to send a message to a channel which processes might subscribe to. It's like a pool of workers, so
+	// if five processes subscribe to a 'tasks' channel, any message going down that channel will be grabbed by the first process to be ready to receive
+	//
+	// Although this function is provided I would say don't use it. If you start doing significant work in your main() thread, you will need to watch for unix kill signals
+	// because the main() is outside of this process group. A better design pattern is to set everything up and put everything you want your app to do into processes, and then
+	// have the main thread just call ProcessGroup.Wait() and hang around until all processes end (which they will on unix kill because this library is taking care of it for you).
+	func (pg *ProcessGroup) SendSubscriberMesssage(subject string, message interface{}) bool {
+
+		// Avoid needing a constructor by putting this at the top of all public methods
+		pg.setup()
+
+		pg.lock.RLock()
+		channel, exists := pg.workChannels[subject]
+		pg.lock.RUnlock()
+
+		if(!exists) {
+
+			return false
+		}
+
+		// Send this message if it's possible to do so, otherwise return false
+		select {
+
+			case channel <- message:
+
+				return true
+
+			default:
+		}
+
+		return false
+	}
+
 	func (pg *ProcessGroup) Log() []struct{ Date time.Time; Process, Event string } {
 
 		// With every public method calling setup, we avoid the need for a constructor function and it becomes safe
@@ -285,6 +346,26 @@ type processAction func(process Process)
 		return process, true
 	}
 
+	func (pg *ProcessGroup) subscribe(subject string) chan interface{} {
+
+		// Does this channel exist?
+		pg.lock.RLock()
+		channel, exists := pg.workChannels[subject]
+		pg.lock.RUnlock()
+
+		if(!exists) {
+
+			// Let's create this
+			channel = make(chan interface{}, 100)
+
+			pg.lock.Lock()
+			pg.workChannels[subject] = channel
+			pg.lock.Unlock()
+		}
+
+		return channel
+	}
+
 
 
 	type Process struct {
@@ -294,7 +375,9 @@ type processAction func(process Process)
 		cancel context.CancelFunc
 		channel chan interface{}
 		group_channel chan groupMessage
+		subscribed_channels []chan interface{}
 		stop_on_error bool
+		parent *ProcessGroup
 	}
 
 	// An easy to use function for end users to check if a process is still, for want of a better word, "alive"
@@ -347,6 +430,32 @@ type processAction func(process Process)
 		}
 	}
 
+	// Wait for something from our subscribed work channels
+	func (p *Process) WaitForSubscribedMessage() interface{} {
+
+		var cases []reflect.SelectCase
+		for _, ch := range p.subscribed_channels {
+			cases = append(cases, reflect.SelectCase{
+				Dir:  reflect.SelectRecv,
+				Chan: reflect.ValueOf(ch),
+				Send: reflect.Value{},
+			})
+		}
+
+		// Add in our instruction to die so we die in a timely fashion when required
+		cases = append(cases, reflect.SelectCase{ Dir: reflect.SelectRecv, Chan: reflect.ValueOf(p.context.Done()), Send: reflect.Value{} })
+
+		// Get a subscribed message
+		_, val, ok := reflect.Select(cases)
+
+		if(ok) {
+
+			return val
+		}
+
+		return nil
+	}
+
 	// This is cool - allow the end user to message any other process directly from their individual processes
 	func (p *Process) SendMessage(to string, message interface{}) {
 
@@ -381,12 +490,34 @@ type processAction func(process Process)
 		}
 	}
 
+	// Subscribe to a channel which multiple processes can join - the idea being you have some work three or four processes can do depending on whoever is free, and you subscribe
+	// them all to a channel and then pipe a packet of work down that shared channel. Messages for a shared channel just arrive via the CheckForMessage() and WaitForMessage() functions
+	func (p *Process) Subscribe(subject string) {
+
+		// Pass this back to the parent
+		p.subscribed_channels = append(p.subscribed_channels, p.parent.subscribe(subject))
+	}
+
 	// Allow processes to contribute to a group log of what's been going on
 	func (p *Process) Log(event string) {
 
 		msg := groupMessage{ Sender: p.Name, Log: true, Message: event }
 
 		// Keep everything here non blocking, so things are very thread safe
+		select {
+
+			case p.group_channel <- msg:
+			default:
+		}
+	}
+
+	// Allow processes to send a message to a subscriber channel (a channel multiple processes are watching and messages are taken off first come, first served)
+	func (p *Process) SendSubsriberMessage(subject string, message interface{}) {
+
+		// Send a message to control, asking for a subscriber message to be distributed
+		msg := groupMessage{ Sender: p.Name, Subscriber: true, Subject: subject, Message: message }
+
+		// Make all send operations non blocking, so we're ready for whatever the end coder comes up with
 		select {
 
 			case p.group_channel <- msg:
@@ -414,11 +545,10 @@ type processAction func(process Process)
 	}
 
 
-
+	// Internal message structure for control messages which will be routed around the processes
 	type groupMessage struct {
 
-		Sender string
-		Recipient string
-		Broadcast, Log, Error bool
+		Sender, Recipient, Subject string
+		Broadcast, Log, Error, Subscriber bool
 		Message interface{}
 	}
