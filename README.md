@@ -13,6 +13,7 @@ processes.
 - Make a single process stop on error, or even the whole process group stop on an error in any of it's processes.
 - Simple, well documented code which you can adapt to perfectly fit your needs
 - Thread safe; the manager struct could be declared globally and all processes could be used to start / stop other processes
+- Ability to subscribe processes to channels where messages are received on a first come / first served basis i.e. a pool of workers
 
 There is no need to start a wait group or call a Done() function when your processes end; simply return out of the process function.
 

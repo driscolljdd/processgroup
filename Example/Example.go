@@ -113,6 +113,7 @@ import (
 				continue
 			}
 
+			// In this instance our workPacket is a string but of course it could be a complex struct full of work to process. Just type cast to the right type eg.  workPacket := process.WaitForSubscribedMessage().(complexStruct)
 			fmt.Println("Worker",process.Name,"got this work packet:",workPacket)
 		}
 	}
